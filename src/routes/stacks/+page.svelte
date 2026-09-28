@@ -227,6 +227,9 @@
 	function openVersionModal(container: StackContainer) {
 		versionModalContainer = container;
 	}
+	function handleVersionUpdated() {
+		fetchStacks();
+	}
 	let envHasScanning = $state(false);
 	let envVulnerabilityCriteria = $state<'never' | 'any' | 'critical_high' | 'critical' | 'more_than_current'>('never');
 
@@ -3092,6 +3095,7 @@
 	bind:container={versionModalContainer}
 	newerVersion={versionModalContainer?.newerVersion ?? null}
 	{envId}
+	onUpdated={handleVersionUpdated}
 />
 
 <BatchOperationModal

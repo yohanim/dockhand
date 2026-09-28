@@ -55,7 +55,7 @@
 			{#if behind > 1}
 				<p class="text-xs text-muted-foreground">{behind} versions ahead of the tag you run.</p>
 			{/if}
-			<p class="text-xs text-muted-foreground">Click for release notes. Never auto-applied.</p>
+			<p class="text-xs text-muted-foreground">Click for release notes and to apply the update.</p>
 		</div>
 	</Tooltip.Content>
 </Tooltip.Root>

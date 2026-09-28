@@ -58,8 +58,11 @@ import { deleteGitStackFiles, parseEnvFileContent } from './git';
 import { isDeletableStackDir } from './stack-delete-guard';
 import { cleanPem } from '$lib/utils/pem';
 import { rewriteComposeVolumePaths, getHostDataDir } from './host-path';
-import { getOrderValue } from './container-labels';
+import { getOrderValue, isUpdateDisabledByLabel, isHiddenByLabel } from './container-labels';
 import { pendingRowsToClear } from './pending-updates-core';
+import { isSystemContainer } from './scheduler/tasks/update-utils';
+import { bumpServiceImageTag } from './semver/apply-tag';
+import * as yaml from 'js-yaml';
 import { buildDockhandOverrideFile } from './dockhand-override-file';
 
 // =============================================================================
@@ -3470,6 +3473,152 @@ export async function updateStackService(
 		result.nonSecretVars,
 		result.secretVars
 	);
+}
+
+export interface VersionBumpResult {
+	success: boolean;
+	error?: string;
+	imageBumpedServices: string[];
+	redeployServices: string[];
+	/** Per-service outcome, keyed by service name. */
+	results: Record<string, { success: boolean; detail: string }>;
+}
+
+/**
+ * Apply a newer-version-tag suggestion (see semver/apply-tag.ts) to one service in a
+ * stack's compose file: pull the new image, write the tag into the compose file, then
+ * `docker compose up -d --no-deps` just the affected service(s) via updateStackService -
+ * the same compose-native path deployStack uses, so the file just saved is what
+ * actually gets deployed (no parallel Docker-API recreate that could drift from it).
+ *
+ * Serialized per-stack with the same lock deployStack uses. The new image is pulled
+ * BEFORE the compose file is touched, so an unpullable tag never leaves the file
+ * pointing at an image nothing can run.
+ */
+export async function applyServiceVersionBump(
+	stackName: string,
+	serviceName: string,
+	newTag: string,
+	envId?: number | null
+): Promise<VersionBumpResult> {
+	return withStackLock(stackName, async () => {
+		const composeResult = await requireComposeFile(stackName, envId);
+		if (!composeResult.success || !composeResult.content) {
+			return {
+				success: false,
+				error: composeResult.error || `Compose file not found for stack "${stackName}"`,
+				imageBumpedServices: [],
+				redeployServices: [],
+				results: {}
+			};
+		}
+
+		// Cascade must never sweep in a system container (Dockhand/Hawser) or a service
+		// the user explicitly opted out of updates via label - the PRIMARY service is
+		// checked by the caller before this is invoked; this only guards siblings pulled
+		// in by an x-dockhand.update.cascade policy the compose author configured.
+		const { listContainers } = await import('./docker.js');
+		const stackContainers = (await listContainers(true, envId)).filter(
+			(c) => c.labels?.['com.docker.compose.project'] === stackName
+		);
+		const protectedServices: string[] = [];
+		for (const c of stackContainers) {
+			const svc = c.labels?.['com.docker.compose.service'];
+			if (!svc || svc === serviceName) continue;
+			if (isSystemContainer(c.image) || isUpdateDisabledByLabel(c.labels) || isHiddenByLabel(c.labels)) {
+				protectedServices.push(svc);
+			}
+		}
+
+		const plan = bumpServiceImageTag(composeResult.content, serviceName, newTag, { extraExclude: protectedServices });
+		if ('error' in plan) {
+			return { success: false, error: plan.error, imageBumpedServices: [], redeployServices: [], results: {} };
+		}
+
+		// A compose.override.yaml/docker-compose.override.yml is first-class in Dockhand
+		// (deployStack always includes it - see findComposeOverrideFile callers) and can
+		// set its own `image:` per service. bumpServiceImageTag only ever edits the BASE
+		// file, so if the override also pins an image for any service we're about to
+		// touch, editing the base alone would silently diverge from what actually
+		// deploys (the override always wins) - refuse rather than lie about success.
+		if (composeResult.stackDir && composeResult.composePath) {
+			const overridePath = findComposeOverrideFile(composeResult.stackDir, basename(composeResult.composePath));
+			if (overridePath) {
+				let overrideParsed: any;
+				try {
+					overrideParsed = yaml.load(readFileSync(overridePath, 'utf-8'));
+				} catch (e: any) {
+					return {
+						success: false,
+						error: `Could not parse override file "${basename(overridePath)}": ${e?.message || e}`,
+						imageBumpedServices: [],
+						redeployServices: [],
+						results: {}
+					};
+				}
+				const shadowed = plan.imageBumpedServices.filter(
+					(svc) => typeof overrideParsed?.services?.[svc]?.image === 'string'
+				);
+				if (shadowed.length > 0) {
+					return {
+						success: false,
+						error: `"${basename(overridePath)}" also sets image: for ${shadowed.join(', ')} - edit the tag there instead, the override always wins over the base file`,
+						imageBumpedServices: [],
+						redeployServices: [],
+						results: {}
+					};
+				}
+			}
+		}
+
+		for (const svc of plan.imageBumpedServices) {
+			const pulled = await pullStackService(stackName, svc, envId);
+			if (!pulled.success) {
+				return {
+					success: false,
+					error: `Failed to pull ${plan.imageRefs[svc]} for service "${svc}": ${pulled.error || 'pull failed'}`,
+					imageBumpedServices: [],
+					redeployServices: [],
+					results: {}
+				};
+			}
+		}
+
+		const saved = await saveStackComposeFile(stackName, plan.content, false, envId);
+		if (!saved.success) {
+			return {
+				success: false,
+				error: saved.error || 'Failed to save compose file',
+				imageBumpedServices: [],
+				redeployServices: [],
+				results: {}
+			};
+		}
+
+		const results: VersionBumpResult['results'] = {};
+		for (const svc of plan.imageBumpedServices) {
+			const updated = await updateStackService(stackName, svc, envId);
+			results[svc] = {
+				success: updated.success,
+				detail: updated.success ? `updated to ${plan.imageRefs[svc]}` : updated.error || 'update failed'
+			};
+		}
+		for (const svc of plan.redeployServices) {
+			if (plan.imageBumpedServices.includes(svc)) continue;
+			const updated = await updateStackService(stackName, svc, envId);
+			results[svc] = {
+				success: updated.success,
+				detail: updated.success ? 'redeployed (cascade)' : updated.error || 'redeploy failed'
+			};
+		}
+
+		return {
+			success: plan.imageBumpedServices.every((svc) => results[svc]?.success),
+			imageBumpedServices: plan.imageBumpedServices,
+			redeployServices: plan.redeployServices,
+			results
+		};
+	});
 }
 
 // =============================================================================

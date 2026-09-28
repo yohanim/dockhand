@@ -28,9 +28,11 @@
 		/** The newer-version suggestion (target tag + skipped versions). */
 		newerVersion: NewerVersion | null;
 		envId: number | null;
+		/** Called after a successful "Update to <tag>" apply, so the caller can refresh its list. */
+		onUpdated?: (containerId: string) => void;
 	}
 
-	let { container = $bindable(), newerVersion, envId }: Props = $props();
+	let { container = $bindable(), newerVersion, envId, onUpdated }: Props = $props();
 
 	const open = $derived(!!container && !!newerVersion);
 
@@ -66,6 +68,8 @@
 		const key = `${container.id}:${newerVersion.tag}`;
 		if (loadedFor === key) return;
 		loadedFor = key;
+		applyError = null;
+		applyLog = [];
 		void loadNotes(container.id, versionPath);
 	});
 
@@ -122,7 +126,68 @@
 	}
 
 	function close() {
+		if (applying) return; // can't dismiss mid-request - the bound container/tag must stay put
 		container = null;
+		applyError = null;
+		applyLog = [];
+	}
+
+	let applying = $state(false);
+	let applyError = $state<string | null>(null);
+	let applyLog = $state<string[]>([]);
+
+	async function applyUpdate() {
+		if (!container || !newerVersion || applying) return;
+		// Capture identity before the request - `container`/`newerVersion` are
+		// $bindable/reactive props the parent could repoint while we're mid-flight
+		// (the Update/Close buttons are disabled meanwhile, but stay defensive).
+		const requestContainerId = container.id;
+		const requestTag = newerVersion.tag;
+		applying = true;
+		applyError = null;
+		applyLog = [];
+		try {
+			const res = await fetch(appendEnvParam(`/api/containers/${requestContainerId}/apply-newer-version`, envId), {
+				method: 'POST'
+			});
+			const data = await res.json();
+			// If the modal has since moved on to a different container/tag, none of
+			// this response describes what's now on screen - don't touch this
+			// instance's state, but still tell the caller so ITS list stays fresh.
+			const stillSameContext = container?.id === requestContainerId && newerVersion?.tag === requestTag;
+
+			if (!res.ok) {
+				if (stillSameContext) applyError = data.error || 'Failed to apply the update';
+				return;
+			}
+
+			const results = (data.results ?? {}) as Record<string, { success: boolean; detail: string }>;
+			const lines = Object.entries(results).map(([svc, r]) => `${svc}: ${r.detail}`);
+			const anyFailed = Object.values(results).some((r) => !r.success);
+
+			// The server has already applied whatever it could - refresh the caller's
+			// list regardless of the outcome, so a partial (or even fully successful)
+			// cascade isn't left showing stale pending-update state.
+			onUpdated?.(requestContainerId);
+			if (!stillSameContext) return;
+
+			if (data.success && !anyFailed) {
+				toast.success(`Updated to ${requestTag}`);
+				close();
+			} else if (data.success) {
+				// The requested tag bump succeeded, but at least one cascade-only
+				// redeploy didn't - never hide that behind a plain success toast.
+				toast.warning(`Updated to ${requestTag}, but some cascade services had issues`);
+				applyLog = lines;
+			} else {
+				applyError = 'Some services failed to update.';
+				applyLog = lines;
+			}
+		} catch (e: any) {
+			if (container?.id === requestContainerId) applyError = e?.message || 'Failed to apply the update';
+		} finally {
+			applying = false;
+		}
 	}
 
 	// Note for a given version path entry, if GitHub had one.
@@ -294,6 +359,22 @@
 				{/if}
 			</div>
 
+			{#if applyError}
+				<div class="rounded-md border border-red-400/40 bg-red-400/10 px-3 py-2 text-xs text-red-400 space-y-1">
+					<p>{applyError}</p>
+					{#each applyLog as line}
+						<p class="font-mono text-2xs text-red-400/80">{line}</p>
+					{/each}
+				</div>
+			{:else if applyLog.length > 0}
+				<div class="rounded-md border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-xs text-amber-500 space-y-1">
+					<p>Updated, but some cascade services had issues:</p>
+					{#each applyLog as line}
+						<p class="font-mono text-2xs text-amber-500/80">{line}</p>
+					{/each}
+				</div>
+			{/if}
+
 			<Dialog.Footer class="flex-row items-center gap-2 sm:justify-between">
 				<div class="text-xs text-muted-foreground">
 					{#if source}
@@ -301,7 +382,14 @@
 					{/if}
 				</div>
 				<div class="flex gap-2">
-					<Button variant="outline" size="sm" onclick={close}>Close</Button>
+					<Button variant="outline" size="sm" onclick={close} disabled={applying}>Close</Button>
+					<Button size="sm" onclick={applyUpdate} disabled={applying}>
+						{#if applying}
+							<RefreshCw class="w-3.5 h-3.5 mr-1.5 animate-spin" /> Updating...
+						{:else}
+							Update to {newerVersion.tag}
+						{/if}
+					</Button>
 				</div>
 			</Dialog.Footer>
 		{/if}

@@ -435,6 +435,13 @@
 		versionModalContainer = container;
 		versionModalNewer = newer;
 	}
+	function handleVersionUpdated() {
+		// A cascade can clear the pending-update row of MORE than the one container
+		// the modal was opened for - reload the whole set from the server rather than
+		// hand-patching a single map entry (which would leave cascade siblings stale).
+		void loadPendingUpdates();
+		fetchContainers();
+	}
 
 	// Single container update mode (doesn't overwrite batch list)
 	let singleUpdateContainerId = $state<string | null>(null);
@@ -2710,6 +2717,7 @@
 	bind:container={versionModalContainer}
 	newerVersion={versionModalNewer}
 	{envId}
+	onUpdated={handleVersionUpdated}
 />
 
 <BatchOperationModal
