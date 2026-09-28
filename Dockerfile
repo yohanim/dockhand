@@ -88,6 +88,12 @@ RUN MAKEFLAGS="-j$(nproc)" npm ci --ignore-scripts \
 
 # Copy source code and build
 COPY . .
+# Vite/Rollup bundling ~270 routes exceeds V8's default old-space heap on
+# memory-tight build hosts (observed OOM around 2GB on a resource-limited NAS) -
+# raise the ceiling explicitly. Only helps if the host actually has the RAM to
+# grant; on a truly memory-starved box this still needs freeing memory first
+# or building elsewhere.
+ENV NODE_OPTIONS="--max-old-space-size=4096"
 RUN npm run build
 
 # Production dependencies only
